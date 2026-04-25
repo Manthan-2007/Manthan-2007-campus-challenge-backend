@@ -205,7 +205,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
     : `${req.protocol}://${req.get('host')}`;
   const url = `${host}/uploads/${req.file.filename}`;
-  res.json({ url, filename: req.file.originalname });
+  res.json({ url, filename: req.file.filename, originalName: req.file.originalname });
 });
 
 app.post('/api/music', (req, res) => {
