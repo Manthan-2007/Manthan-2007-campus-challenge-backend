@@ -114,7 +114,7 @@ app.post('/api/queue/join', (req, res) => {
   const { userId } = req.body;
   db.run(`INSERT OR REPLACE INTO match_queue (userId, status, matchId) VALUES (?, 'waiting', NULL)`, [userId], function (err) {
     if (err) return res.status(500).json({ error: err.message });
-    
+
     // Try to find a match right away
     db.get(`SELECT userId FROM match_queue WHERE status = 'waiting' AND userId != ? LIMIT 1`, [userId], (err, other) => {
       if (other) {
@@ -122,13 +122,13 @@ app.post('/api/queue/join', (req, res) => {
         const isGiver = Math.random() > 0.5;
         const giverId = isGiver ? userId : other.userId;
         const completerId = isGiver ? other.userId : userId;
-        
-        db.run(`INSERT INTO matches (id, giverId, completerId, status) VALUES (?, ?, ?, 'PENDING_TASK')`, 
-          [matchId, giverId, completerId], function(err) {
+
+        db.run(`INSERT INTO matches (id, giverId, completerId, status) VALUES (?, ?, ?, 'PENDING_TASK')`,
+          [matchId, giverId, completerId], function (err) {
             if (err) return console.error(err);
-            db.run(`UPDATE match_queue SET status = 'matched', matchId = ? WHERE userId IN (?, ?)`, 
+            db.run(`UPDATE match_queue SET status = 'matched', matchId = ? WHERE userId IN (?, ?)`,
               [matchId, userId, other.userId]);
-        });
+          });
       }
       res.json({ success: true });
     });
@@ -158,20 +158,20 @@ app.get('/api/match', (req, res) => {
 
 app.post('/api/match/task', (req, res) => {
   const { matchId, taskText } = req.body;
-  db.run(`UPDATE matches SET status = 'ACTIVE', taskText = ?, taskCreatedAt = CURRENT_TIMESTAMP WHERE id = ?`, 
-    [taskText, matchId], function(err) {
+  db.run(`UPDATE matches SET status = 'ACTIVE', taskText = ?, taskCreatedAt = CURRENT_TIMESTAMP WHERE id = ?`,
+    [taskText, matchId], function (err) {
       if (err) return res.status(500).json({ error: err.message });
       res.json({ success: true });
-  });
+    });
 });
 
 app.post('/api/match/proof', (req, res) => {
   const { matchId, proofType, proofText, proofMediaUrl } = req.body;
   db.run(`UPDATE matches SET status = 'PENDING_REVIEW', proofType = ?, proofText = ?, proofMediaUrl = ?, submissionCreatedAt = CURRENT_TIMESTAMP WHERE id = ?`,
-    [proofType, proofText, proofMediaUrl, matchId], function(err) {
+    [proofType, proofText, proofMediaUrl, matchId], function (err) {
       if (err) return res.status(500).json({ error: err.message });
       res.json({ success: true });
-  });
+    });
 });
 
 app.post('/api/match/review', (req, res) => {
@@ -179,9 +179,9 @@ app.post('/api/match/review', (req, res) => {
   const approved = action === 'approve';
   const scoreDelta = approved ? 10 : -5;
 
-  db.run(`UPDATE matches SET status = ? WHERE id = ?`, [approved ? 'APPROVED' : 'REJECTED', matchId], function(err) {
+  db.run(`UPDATE matches SET status = ? WHERE id = ?`, [approved ? 'APPROVED' : 'REJECTED', matchId], function (err) {
     if (err) return res.status(500).json({ error: err.message });
-    db.run(`UPDATE users SET score = score + ? WHERE id = ?`, [scoreDelta, completerId], function(err) {
+    db.run(`UPDATE users SET score = score + ? WHERE id = ?`, [scoreDelta, completerId], function (err) {
       if (approved) {
         db.get(`SELECT name, score FROM users WHERE id = ?`, [completerId], (err, user) => {
           db.run(`INSERT INTO feed (userId, userName, taskText, proofType, scoreAtPost) VALUES (?, ?, ?, ?, ?)`,
@@ -201,7 +201,10 @@ app.post('/api/match/expire', (req, res) => {
 // --- MEDIA & MUSIC ---
 app.post('/api/upload', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-  const url = `http://localhost:3001/uploads/${req.file.filename}`;
+  const host = process.env.RAILWAY_PUBLIC_DOMAIN
+    ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+    : `${req.protocol}://${req.get('host')}`;
+  const url = `${host}/uploads/${req.file.filename}`;
   res.json({ url, filename: req.file.originalname });
 });
 
@@ -209,10 +212,10 @@ app.post('/api/music', (req, res) => {
   const { userId, fileName, downloadURL } = req.body;
   const id = uuidv4();
   db.run(`INSERT INTO music (id, userId, fileName, downloadURL) VALUES (?, ?, ?, ?)`,
-    [id, userId, fileName, downloadURL], function(err) {
+    [id, userId, fileName, downloadURL], function (err) {
       if (err) return res.status(500).json({ error: err.message });
       res.json({ success: true, id });
-  });
+    });
 });
 
 app.get('/api/music', (req, res) => {
@@ -224,7 +227,7 @@ app.get('/api/music', (req, res) => {
 });
 
 app.delete('/api/music/:id', (req, res) => {
-  db.run(`DELETE FROM music WHERE id = ?`, [req.params.id], function(err) {
+  db.run(`DELETE FROM music WHERE id = ?`, [req.params.id], function (err) {
     if (err) return res.status(500).json({ error: err.message });
     res.json({ success: true });
   });
@@ -244,11 +247,11 @@ app.get('/api/user-info', (req, res) => {
 app.post("/api/moderate", (req, res) => {
   const { text } = req.body;
   if (!text) return res.status(400).json({ error: "No text provided" });
-  
+
   const BLOCKED = ["kill", "suicide", "self harm", "rape", "sex", "nude", "bomb", "gun", "knife", "drugs", "cocaine", "heroin", "steal", "rob", "hack", "terror"];
   const t = text.toLowerCase();
   const isAbnormal = BLOCKED.some((w) => t.includes(w));
-  
+
   res.json({ result: isAbnormal ? "abnormal" : "normal", abnormal: isAbnormal });
 });
 
