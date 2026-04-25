@@ -230,6 +230,16 @@ app.delete('/api/music/:id', (req, res) => {
   });
 });
 
+// --- PUBLIC USER INFO (for opponent reveal) ---
+app.get('/api/user-info', (req, res) => {
+  const { id } = req.query;
+  if (!id) return res.status(400).json({ error: 'User ID required' });
+  db.get(`SELECT id, name, course, department, section, score FROM users WHERE id = ?`, [id], (err, user) => {
+    if (err || !user) return res.status(404).json({ error: 'User not found' });
+    res.json(user);
+  });
+});
+
 // --- MODERATION ---
 app.post("/api/moderate", (req, res) => {
   const { text } = req.body;
