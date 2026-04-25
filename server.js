@@ -255,6 +255,21 @@ app.post("/api/moderate", (req, res) => {
   res.json({ result: isAbnormal ? "abnormal" : "normal", abnormal: isAbnormal });
 });
 
+// --- ADMIN ---
+app.get('/api/admin/wipe', (req, res) => {
+  // Wipe all data from all tables to reset the game
+  db.serialize(() => {
+    db.run("DELETE FROM matches");
+    db.run("DELETE FROM match_queue");
+    db.run("DELETE FROM feed");
+    db.run("DELETE FROM music");
+    db.run("DELETE FROM users", (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+      res.json({ success: true, message: "Database fully wiped!" });
+    });
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Backend running on http://localhost:${PORT}`);
 });
