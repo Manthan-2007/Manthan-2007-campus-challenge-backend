@@ -1,217 +1,351 @@
-const express = require('express');
-const cors = require('cors');
-const multer = require('multer');
-const { randomUUID: uuidv4 } = require('crypto');
-const path = require('path');
-const fs = require('fs');
-const db = require('./database');
+/* ==========================================================
+   CAMPUS CHALLENGE — Express + SQLite Backend
+   ========================================================== */
+const express  = require('express');
+const cors     = require('cors');
+const multer   = require('multer');
+const path     = require('path');
+const fs       = require('fs');
+const crypto   = require('crypto');
 require('dotenv').config();
+const db       = require('./database');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3001;
 
-// Ensure uploads directory exists (important for Railway)
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
-if (!fs.existsSync(UPLOADS_DIR)) {
-  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-  console.log('Created uploads directory');
+/* ---------- CORS ---------- */
+app.use(cors({ origin: '*', methods: ['GET','POST','DELETE','OPTIONS'], allowedHeaders: ['Content-Type'] }));
+app.use(express.json());
+
+/* ---------- Uploads dir ---------- */
+const UPLOADS = path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOADS)) fs.mkdirSync(UPLOADS, { recursive: true });
+app.use('/uploads', express.static(UPLOADS));
+
+/* ---------- Multer ---------- */
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, UPLOADS),
+  filename:    (_req,  file, cb) => {
+    const ext = path.extname(file.originalname);
+    cb(null, `${crypto.randomUUID()}${ext}`);
+  }
+});
+const upload = multer({ storage, limits: { fileSize: 100 * 1024 * 1024 } });
+
+/* ---------- DB helpers ---------- */
+const dbGet = (sql, p=[]) => new Promise((res,rej) => db.get(sql, p, (e,r)  => e ? rej(e) : res(r)));
+const dbAll = (sql, p=[]) => new Promise((res,rej) => db.all(sql, p, (e,rr) => e ? rej(e) : res(rr)));
+const dbRun = (sql, p=[]) => new Promise((res,rej) => db.run(sql, p, function(e){ e ? rej(e) : res(this); }));
+const uid   = ()           => crypto.randomUUID();
+
+/* ---------- AI Moderation ---------- */
+const UNSAFE_KEYWORDS = [
+  'sex','porn','nude','naked','rape','kill','murder','suicide',
+  'bomb','terrorist','drug','cocaine','heroin','meth',
+  'fuck','shit','bitch','ass','dick','pussy'
+];
+
+async function checkTextToxicity(text) {
+  const lower = text.toLowerCase();
+  if (UNSAFE_KEYWORDS.some(kw => lower.includes(kw))) return true;
+
+  const groqKey = process.env.GROQ_API_KEY;
+  if (!groqKey) return false;
+
+  try {
+    const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${groqKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'llama3-8b-8192',
+        messages: [
+          { role: 'system', content: 'You are a content moderator for a campus game. Classify if the task text is SAFE or UNSAFE. Unsafe = sexual, violent, illegal, or harmful content. Reply with ONE word: SAFE or UNSAFE.' },
+          { role: 'user', content: text }
+        ],
+        max_tokens: 5,
+        temperature: 0,
+      })
+    });
+    if (!resp.ok) return false;
+    const data = await resp.json();
+    return data.choices?.[0]?.message?.content?.trim().toUpperCase() === 'UNSAFE';
+  } catch (e) {
+    console.error('Groq error:', e.message);
+    return false;
+  }
 }
 
-app.use(cors());
-app.use(express.json());
-app.use('/uploads', express.static(UPLOADS_DIR));
+/* ==========================================================
+   AUTH
+   ========================================================== */
 
-// Configure Multer for file uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${Date.now()}-${uuidv4()}${ext}`);
-  }
+// POST /api/signup
+app.post('/api/signup', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+
+    const existing = await dbGet('SELECT id FROM users WHERE email = ?', [email]);
+    if (existing) return res.status(409).json({ error: 'Email already registered' });
+
+    const id = uid();
+    // Using simple plain password as requested by the original server.js fallback
+    // (If the user needs bcrypt, we can use it, but plain was in their previous server.js)
+    await dbRun('INSERT INTO users (id, email, password, name, score) VALUES (?, ?, ?, ?, 0)',
+      [id, email, password, email.split('@')[0]]);
+    res.json({ id, email, name: email.split('@')[0], score: 0 });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
-const upload = multer({ storage });
 
-// --- AUTH ENDPOINTS ---
-app.post('/api/signup', (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+// POST /api/login
+app.post('/api/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
-  const id = uuidv4();
-  const name = email.split('@')[0];
-  db.run(`INSERT INTO users (id, email, password, name) VALUES (?, ?, ?, ?)`, [id, email, password, name], function (err) {
-    if (err) {
-      if (err.message.includes('UNIQUE')) return res.status(400).json({ error: 'Email already exists' });
-      return res.status(500).json({ error: err.message });
+    const user = await dbGet('SELECT * FROM users WHERE email = ? AND password = ?', [email, password]);
+    if (!user) return res.status(401).json({ error: 'Invalid email or password' });
+
+    res.json({ id: user.id, email: user.email, name: user.name, score: user.score });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/me?id=
+app.get('/api/me', async (req, res) => {
+  try {
+    const { id } = req.query;
+    if (!id) return res.status(400).json({ error: 'id required' });
+    const user = await dbGet(
+      'SELECT id, email, name, course, department, section, score, settings FROM users WHERE id = ?', [id]);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    user.settings = user.settings ? JSON.parse(user.settings) : {};
+    res.json(user);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/user-info?id=
+app.get('/api/user-info', async (req, res) => {
+  try {
+    const { id } = req.query;
+    const user = await dbGet(
+      'SELECT id, name, course, department, section, score FROM users WHERE id = ?', [id]);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json(user);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/profile
+app.post('/api/profile', async (req, res) => {
+  try {
+    const { id, name, course, department, section } = req.body;
+    await dbRun('UPDATE users SET name=?, course=?, department=?, section=? WHERE id=?',
+      [name, course, department, section, id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/settings
+app.post('/api/settings', async (req, res) => {
+  try {
+    const { id, settings } = req.body;
+    const row = await dbGet('SELECT settings FROM users WHERE id = ?', [id]);
+    const prev = row?.settings ? JSON.parse(row.settings) : {};
+    const updated = { ...prev, ...settings };
+    await dbRun('UPDATE users SET settings=? WHERE id=?', [JSON.stringify(updated), id]);
+    res.json({ success: true, settings: updated });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/* ==========================================================
+   MATCHMAKING
+   ========================================================== */
+
+// POST /api/queue/join
+app.post('/api/queue/join', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    // Already matched?
+    const me = await dbGet('SELECT * FROM match_queue WHERE userId = ?', [userId]);
+    if (me?.status === 'matched') return res.json({ status: 'matched', matchId: me.matchId });
+
+    // Find another waiting user
+    const waiting = await dbGet(
+      "SELECT * FROM match_queue WHERE status='waiting' AND userId != ? LIMIT 1", [userId]);
+
+    const now = new Date().toISOString();
+
+    if (waiting) {
+      const matchId = uid();
+      const [giverId, completerId] = Math.random() > 0.5
+        ? [userId, waiting.userId] : [waiting.userId, userId];
+
+      const expiresAt = new Date(Date.now() + 3 * 60 * 1000).toISOString();
+      await dbRun(
+        `INSERT INTO matches (id, giverId, completerId, status, taskCreatedAt, expiresAt, createdAt)
+         VALUES (?, ?, ?, 'PENDING_TASK', ?, ?, ?)`,
+        [matchId, giverId, completerId, now, expiresAt, now]);
+
+      await dbRun("UPDATE match_queue SET status='matched', matchId=? WHERE userId=?",
+        [matchId, waiting.userId]);
+      await dbRun(
+        `INSERT INTO match_queue (userId, status, matchId, joinedAt) VALUES (?, 'matched', ?, ?)
+         ON CONFLICT(userId) DO UPDATE SET status='matched', matchId=?`,
+        [userId, matchId, now, matchId]);
+
+      return res.json({ status: 'matched', matchId });
     }
-    res.json({ id, email, name, score: 0 });
-  });
+
+    // No one waiting — enter queue
+    await dbRun(
+      `INSERT INTO match_queue (userId, status, joinedAt) VALUES (?, 'waiting', ?)
+       ON CONFLICT(userId) DO UPDATE SET status='waiting', matchId=NULL, joinedAt=?`,
+      [userId, now, now]);
+    res.json({ status: 'waiting' });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/login', (req, res) => {
-  const { email, password } = req.body;
-  db.get(`SELECT * FROM users WHERE email = ? AND password = ?`, [email, password], (err, user) => {
-    if (err) return res.status(500).json({ error: err.message });
-    if (!user) return res.status(400).json({ error: 'Invalid email or password' });
-    res.json(user);
-  });
+// GET /api/queue/poll?userId=
+app.get('/api/queue/poll', async (req, res) => {
+  try {
+    const row = await dbGet('SELECT * FROM match_queue WHERE userId = ?', [req.query.userId]);
+    if (!row) return res.json({ status: 'not_in_queue' });
+    res.json({ status: row.status, matchId: row.matchId });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/me', (req, res) => {
-  const { id } = req.query;
-  if (!id) return res.status(400).json({ error: 'User ID required' });
-  db.get(`SELECT * FROM users WHERE id = ?`, [id], (err, user) => {
-    if (err || !user) return res.status(404).json({ error: 'User not found' });
-    res.json(user);
-  });
+// POST /api/queue/leave
+app.post('/api/queue/leave', async (req, res) => {
+  try {
+    await dbRun('DELETE FROM match_queue WHERE userId = ?', [req.body.userId]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/profile', (req, res) => {
-  const { id, name, course, department, section } = req.body;
-  db.run(`UPDATE users SET name = ?, course = ?, department = ?, section = ? WHERE id = ?`,
-    [name, course, department, section, id], function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ success: true });
-    });
+// GET /api/match?matchId=
+app.get('/api/match', async (req, res) => {
+  try {
+    const match = await dbGet('SELECT * FROM matches WHERE id = ?', [req.query.matchId]);
+    if (!match) return res.status(404).json({ error: 'Match not found' });
+    res.json(match);
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/settings', (req, res) => {
-  const { id, settings } = req.body;
-  db.get(`SELECT settings FROM users WHERE id = ?`, [id], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    const current = row.settings ? JSON.parse(row.settings) : {};
-    const updated = { ...current, ...settings };
-    db.run(`UPDATE users SET settings = ? WHERE id = ?`, [JSON.stringify(updated), id], function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ success: true, settings: updated });
-    });
-  });
-});
+/* ==========================================================
+   TASK
+   ========================================================== */
 
-// --- FEED & LEADERBOARD ---
-app.get('/api/feed', (req, res) => {
-  db.all(`SELECT * FROM feed ORDER BY createdAt DESC LIMIT 30`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
-});
-
-app.get('/api/feed/user', (req, res) => {
-  const { id } = req.query;
-  db.all(`SELECT * FROM feed WHERE userId = ? ORDER BY createdAt DESC LIMIT 20`, [id], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
-});
-
-app.get('/api/leaderboard', (req, res) => {
-  db.all(`SELECT id, name, score FROM users ORDER BY score DESC LIMIT 20`, [], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
-});
-
-// --- MATCHMAKING ---
-app.post('/api/queue/join', (req, res) => {
-  const { userId } = req.body;
-  db.run(`INSERT OR REPLACE INTO match_queue (userId, status, matchId) VALUES (?, 'waiting', NULL)`, [userId], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
-
-    // Try to find a match right away
-    db.get(`SELECT userId FROM match_queue WHERE status = 'waiting' AND userId != ? LIMIT 1`, [userId], (err, other) => {
-      if (other) {
-        const matchId = uuidv4();
-        const isGiver = Math.random() > 0.5;
-        const giverId = isGiver ? userId : other.userId;
-        const completerId = isGiver ? other.userId : userId;
-
-        db.run(`INSERT INTO matches (id, giverId, completerId, status) VALUES (?, ?, ?, 'PENDING_TASK')`,
-          [matchId, giverId, completerId], function (err) {
-            if (err) return console.error(err);
-            db.run(`UPDATE match_queue SET status = 'matched', matchId = ? WHERE userId IN (?, ?)`,
-              [matchId, userId, other.userId]);
-          });
-      }
-      res.json({ success: true });
-    });
-  });
-});
-
-app.get('/api/queue/poll', (req, res) => {
-  const { userId } = req.query;
-  db.get(`SELECT * FROM match_queue WHERE userId = ?`, [userId], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(row || { status: 'none' });
-  });
-});
-
-app.post('/api/queue/leave', (req, res) => {
-  const { userId } = req.body;
-  db.run(`DELETE FROM match_queue WHERE userId = ?`, [userId], () => res.json({ success: true }));
-});
-
-app.get('/api/match', (req, res) => {
-  const { matchId } = req.query;
-  db.get(`SELECT * FROM matches WHERE id = ?`, [matchId], (err, row) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(row);
-  });
-});
-
+// POST /api/match/task
 app.post('/api/match/task', async (req, res) => {
-  const { matchId, taskText } = req.body;
-  
-  // Check if task is appropriate using AI moderation
-  const moderation = await checkTextToxicity(taskText);
-  
-  if (moderation.isToxic) {
-    return res.status(400).json({ 
-      error: "Task contains inappropriate content. Please write a clean task.",
-      moderated: true,
-      score: moderation.score
-    });
-  }
+  try {
+    const { matchId, taskText } = req.body;
+    if (!matchId || !taskText) return res.status(400).json({ error: 'matchId and taskText required' });
 
-  db.run(`UPDATE matches SET status = 'ACTIVE', taskText = ?, taskCreatedAt = CURRENT_TIMESTAMP WHERE id = ?`,
-    [taskText, matchId], function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ success: true, moderated: true, score: moderation.score });
-    });
+    const unsafe = await checkTextToxicity(taskText);
+    if (unsafe) return res.status(422).json({ error: 'Task blocked by moderation', blocked: true });
+
+    const now      = new Date().toISOString();
+    const expires  = new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString();
+    await dbRun(
+      "UPDATE matches SET taskText=?, status='ACTIVE', taskCreatedAt=?, expiresAt=? WHERE id=?",
+      [taskText, now, expires, matchId]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/match/proof', (req, res) => {
-  const { matchId, proofType, proofText, proofMediaUrl } = req.body;
-  db.run(`UPDATE matches SET status = 'PENDING_REVIEW', proofType = ?, proofText = ?, proofMediaUrl = ?, submissionCreatedAt = CURRENT_TIMESTAMP WHERE id = ?`,
-    [proofType, proofText, proofMediaUrl, matchId], function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ success: true });
-    });
+// POST /api/moderate
+app.post('/api/moderate', async (req, res) => {
+  try {
+    const { text } = req.body;
+    if (!text) return res.status(400).json({ error: 'text required' });
+    const abnormal = await checkTextToxicity(text);
+    res.json({ abnormal });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/match/review', (req, res) => {
-  const { matchId, action, completerId, taskText, proofType } = req.body;
-  const approved = action === 'approve';
-  const scoreDelta = approved ? 10 : -5;
+/* ==========================================================
+   PROOF & REVIEW
+   ========================================================== */
 
-  db.run(`UPDATE matches SET status = ? WHERE id = ?`, [approved ? 'APPROVED' : 'REJECTED', matchId], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
-    db.run(`UPDATE users SET score = score + ? WHERE id = ?`, [scoreDelta, completerId], function (err) {
-      if (approved) {
-        db.get(`SELECT name, score FROM users WHERE id = ?`, [completerId], (err, user) => {
-          db.run(`INSERT INTO feed (userId, userName, taskText, proofType, scoreAtPost) VALUES (?, ?, ?, ?, ?)`,
-            [completerId, user.name, taskText, proofType, user.score]);
-        });
-      }
-      res.json({ success: true, scoreDelta });
-    });
-  });
+// POST /api/match/proof
+app.post('/api/match/proof', async (req, res) => {
+  try {
+    const { matchId, proofType, proofText, proofMediaUrl } = req.body;
+    const now = new Date().toISOString();
+    await dbRun(
+      "UPDATE matches SET proofType=?, proofText=?, proofMediaUrl=?, status='PENDING_REVIEW', submissionCreatedAt=? WHERE id=?",
+      [proofType, proofText || null, proofMediaUrl || null, now, matchId]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.post('/api/match/expire', (req, res) => {
-  const { matchId } = req.body;
-  db.run(`UPDATE matches SET status = 'EXPIRED' WHERE id = ?`, [matchId], () => res.json({ success: true }));
+// POST /api/match/expire
+app.post('/api/match/expire', async (req, res) => {
+  try {
+    const { matchId } = req.body;
+    if (!matchId) return res.status(400).json({ error: 'matchId required' });
+    await dbRun(
+      "UPDATE matches SET status='EXPIRED' WHERE id=? AND status IN ('PENDING_TASK','ACTIVE')",
+      [matchId]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- MEDIA & MUSIC ---
+// POST /api/match/review
+app.post('/api/match/review', async (req, res) => {
+  try {
+    const { matchId, action, completerId, taskText, proofType } = req.body;
+    if (!['approve','reject'].includes(action))
+      return res.status(400).json({ error: 'action must be approve or reject' });
+
+    const status     = action === 'approve' ? 'APPROVED' : 'REJECTED';
+    const scoreDelta = action === 'approve' ? 10 : -5;
+
+    await dbRun("UPDATE matches SET status=? WHERE id=?", [status, matchId]);
+
+    if (completerId) {
+      await dbRun('UPDATE users SET score = MAX(0, score + ?) WHERE id=?', [scoreDelta, completerId]);
+    }
+
+    if (action === 'approve' && completerId && taskText) {
+      const user = await dbGet('SELECT name, score FROM users WHERE id=?', [completerId]);
+      await dbRun(
+        'INSERT INTO feed (userId, userName, taskText, proofType, scoreAtPost, createdAt) VALUES (?, ?, ?, ?, ?, ?)',
+        [completerId, user?.name || 'Unknown', taskText, proofType || 'text', user?.score || 0, new Date().toISOString()]);
+    }
+
+    res.json({ success: true, scoreDelta });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/* ==========================================================
+   FEED & LEADERBOARD
+   ========================================================== */
+
+app.get('/api/feed', async (_req, res) => {
+  try {
+    res.json(await dbAll('SELECT * FROM feed ORDER BY createdAt DESC LIMIT 50'));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/feed/user', async (req, res) => {
+  try {
+    res.json(await dbAll('SELECT * FROM feed WHERE userId=? ORDER BY createdAt DESC', [req.query.id]));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/leaderboard', async (_req, res) => {
+  try {
+    res.json(await dbAll(
+      'SELECT id, name, score, course, department FROM users ORDER BY score DESC LIMIT 20'));
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+/* ==========================================================
+   UPLOADS
+   ========================================================== */
+
 app.post('/api/upload', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   const host = process.env.RAILWAY_PUBLIC_DOMAIN
@@ -221,128 +355,34 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
   res.json({ url, filename: req.file.filename, originalName: req.file.originalname });
 });
 
-app.post('/api/music', (req, res) => {
-  const { userId, fileName, downloadURL } = req.body;
-  const id = uuidv4();
-  db.run(`INSERT INTO music (id, userId, fileName, downloadURL) VALUES (?, ?, ?, ?)`,
-    [id, userId, fileName, downloadURL], function (err) {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ success: true, id });
-    });
+/* ==========================================================
+   MUSIC
+   ========================================================== */
+
+app.get('/api/music', async (req, res) => {
+  try {
+    res.json(await dbAll('SELECT * FROM music WHERE userId=? ORDER BY createdAt DESC', [req.query.userId]));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.get('/api/music', (req, res) => {
-  const { userId } = req.query;
-  db.all(`SELECT * FROM music WHERE userId = ? ORDER BY createdAt DESC`, [userId], (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
+app.post('/api/music', async (req, res) => {
+  try {
+    const { userId, fileName, downloadURL } = req.body;
+    const id = uid();
+    await dbRun('INSERT INTO music (id, userId, fileName, downloadURL, createdAt) VALUES (?, ?, ?, ?, ?)',
+      [id, userId, fileName, downloadURL, new Date().toISOString()]);
+    res.json({ success: true, id });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-app.delete('/api/music/:id', (req, res) => {
-  db.run(`DELETE FROM music WHERE id = ?`, [req.params.id], function (err) {
-    if (err) return res.status(500).json({ error: err.message });
+app.delete('/api/music/:id', async (req, res) => {
+  try {
+    await dbRun('DELETE FROM music WHERE id=?', [req.params.id]);
     res.json({ success: true });
-  });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// --- PUBLIC USER INFO (for opponent reveal) ---
-app.get('/api/user-info', (req, res) => {
-  const { id } = req.query;
-  if (!id) return res.status(400).json({ error: 'User ID required' });
-  db.get(`SELECT id, name, course, department, section, score FROM users WHERE id = ?`, [id], (err, user) => {
-    if (err || !user) return res.status(404).json({ error: 'User not found' });
-    res.json(user);
-  });
-});
+/* ---------- Health ---------- */
+app.get('/api/health', (_req, res) => res.json({ success: true, time: new Date().toISOString() }));
 
-// --- MODERATION ---
-// AI Moderation using Groq API
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-
-async function checkTextToxicity(text) {
-  // Fallback: basic keyword blocking if API key not set
-  const BLOCKED = ["kill", "suicide", "self harm", "rape", "sex", "nude", "bomb", "gun", "knife", "drugs", "cocaine", "heroin", "steal", "rob", "hack", "terror"];
-  const t = text.toLowerCase();
-  if (BLOCKED.some((w) => t.includes(w))) {
-    return { isToxic: true, score: 1.0, source: "keyword-filter" };
-  }
-
-  // If API key is set, use Groq API
-  if (GROQ_API_KEY) {
-    try {
-      const response = await fetch(
-        'https://api.groq.com/openai/v1/chat/completions',
-        {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${GROQ_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            model: 'mixtral-8x7b-32768',
-            messages: [
-              {
-                role: 'system',
-                content: 'You are a content moderation assistant. Analyze the following text and respond with ONLY "SAFE" or "UNSAFE". Do not explain, just respond with one word.'
-              },
-              {
-                role: 'user',
-                content: `Check if this text is appropriate for a campus game. Reject if it contains: violence, sexual content, harassment, discrimination, or illegal activities.\n\nText: "${text}"`
-              }
-            ],
-            max_tokens: 10,
-            temperature: 0
-          })
-        }
-      );
-      
-      if (!response.ok) {
-        console.warn("Groq API error:", response.status);
-        return { isToxic: false, score: 0, source: "fallback-http-error" };
-      }
-      
-      const data = await response.json();
-      const content = data.choices?.[0]?.message?.content?.trim().toUpperCase() || "SAFE";
-      const isToxic = content === "UNSAFE";
-      
-      return { isToxic, score: isToxic ? 0.9 : 0.1, source: "groq-api" };
-    } catch (err) {
-      console.error("Groq API error:", err);
-    }
-  }
-
-  return { isToxic: false, score: 0, source: "fallback" };
-}
-
-app.post("/api/moderate", async (req, res) => {
-  const { text } = req.body;
-  if (!text) return res.status(400).json({ error: "No text provided" });
-
-  const result = await checkTextToxicity(text);
-  res.json({ 
-    abnormal: result.isToxic, 
-    result: result.isToxic ? "abnormal" : "normal",
-    score: result.score,
-    source: result.source
-  });
-});
-
-// --- ADMIN ---
-app.get('/api/admin/wipe', (req, res) => {
-  // Wipe all data from all tables to reset the game
-  db.serialize(() => {
-    db.run("DELETE FROM matches");
-    db.run("DELETE FROM match_queue");
-    db.run("DELETE FROM feed");
-    db.run("DELETE FROM music");
-    db.run("DELETE FROM users", (err) => {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ success: true, message: "Database fully wiped!" });
-    });
-  });
-});
-
-app.listen(PORT, () => {
-  console.log(`🚀 Backend running on http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log(`✅ Campus Challenge backend running on port ${PORT}`));
