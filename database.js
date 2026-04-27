@@ -2,7 +2,9 @@ const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const fs = require('fs');
 
-const dbPath = path.resolve(__dirname, 'database.sqlite');
+// In production (Railway), we want to use a persistent volume path
+const dbPath = process.env.DATABASE_PATH || path.resolve(__dirname, 'database.sqlite');
+
 const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
     console.error('Error opening database', err.message);
